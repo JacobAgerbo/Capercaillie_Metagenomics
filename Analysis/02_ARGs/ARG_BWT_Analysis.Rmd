@@ -1,0 +1,315 @@
+---
+title: "METAGENOMIC_ARG_DISCOVERY"
+author: "Jacob Agerbo Rasmussen"
+date: "11/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggfortify)
+library(ggplot2)
+library(readr)
+library(readxl)
+library(dplyr)
+library(RColorBrewer)
+library(wesanderson)
+library(vegan)
+library(ggpubr)
+library(factoextra)
+library(cluster)
+library(cowplot)
+library(ggdendro)
+library(dendextend)
+library(tidyverse)
+library(ComplexHeatmap)
+library(vegan)
+library(tidyverse)
+library(matrixStats)
+library(ADImpute)
+library(cluster)
+library(UpSetR)
+library(ggvenn)
+# one with all sample names, by scanning our "samples" file we made earlier
+path <- "."
+# one holding the file names of all the forward reads
+sample <- sort(list.files(path, pattern=".gene_mapping_data.txt", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(sample), ".gene_mapping_data.txt"), `[`, 1)
+
+## Colors
+set.seed(1) # This makes the plot appear the same each time it is run 
+n <- 100
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+```
+
+
+```{r data loading and handling, echo=FALSE}
+md <- read_excel("metadata.xlsx")
+df.list = lapply(sample, function(i){
+  x = read.delim(i, header = T)
+  x = x[,c(1,12)]
+  x
+})
+names(df.list) <- sample.names
+#merge all ARG results into one file
+ARG_all.x <- merge(df.list[[1]], df.list[[2]], by="ARO.Term", all = T)
+colnames(ARG_all.x) <- c("ARO.Term",sample.names[1:2])
+ARG_all.y <- merge(ARG_all.x, df.list[[3]], by="ARO.Term", all = T)
+colnames(ARG_all.y) <- c("ARO.Term",sample.names[1:3])
+ARG_all.x <- merge(ARG_all.y, df.list[[4]], by="ARO.Term", all = T)
+colnames(ARG_all.x) <- c("ARO.Term",sample.names[1:4])
+ARG_all.y <- merge(ARG_all.x,  df.list[[5]], by="ARO.Term", all = T)
+colnames(ARG_all.y) <- c("ARO.Term",sample.names[1:5])
+ARG_all.x <- merge(ARG_all.y, df.list[[6]], by="ARO.Term", all = T)
+colnames(ARG_all.x) <- c("ARO.Term",sample.names[1:6])
+ARG_all.y <- merge(ARG_all.x, df.list[[7]], by="ARO.Term", all = T)
+colnames(ARG_all.y) <- c("ARO.Term",sample.names[1:7])
+ARG_all.x <- merge(ARG_all.y, df.list[[8]], by="ARO.Term", all = T)
+colnames(ARG_all.x) <- c("ARO.Term",sample.names[1:8])
+
+
+```
+
+```{r get ARG info, warning=FALSE,echo=FALSE}
+ARG.INFO = lapply(sample, function(i){
+  x = read.delim(i, header = T)
+  x
+})
+names(ARG.INFO) <- sample.names
+
+ARGs.class1 <- data.frame("ARG" = ARG.INFO[[1]][,c(1,7,8,23,24,25,26)])
+ARGs.class2 <- data.frame("ARG" = ARG.INFO[[2]][,c(1,7,8,23,24,25,26)])
+ARGs.class3 <- data.frame("ARG" = ARG.INFO[[3]][,c(1,7,8,23,24,25,26)])
+ARGs.class4 <- data.frame("ARG" = ARG.INFO[[4]][,c(1,7,8,23,24,25,26)])
+ARGs.class5 <- data.frame("ARG" = ARG.INFO[[5]][,c(1,7,8,23,24,25,26)])
+ARGs.class6 <- data.frame("ARG" = ARG.INFO[[6]][,c(1,7,8,23,24,25,26)])
+ARGs.class7 <- data.frame("ARG" = ARG.INFO[[7]][,c(1,7,8,23,24,25,26)])
+ARGs.class8 <- data.frame("ARG" = ARG.INFO[[8]][,c(1,7,8,23,24,25,26)])
+ARGs <- rbind(ARGs.class1,ARGs.class2,ARGs.class3,
+              ARGs.class4,ARGs.class5,ARGs.class6,
+              ARGs.class7,ARGs.class8)
+ARGs <- ARGs[!duplicated(ARGs$ARG.ARO.Term), ]
+# Select first size of ARG allele as proxy for gene length
+ARGs <- ARGs %>% tidyr::separate(ARG.Reference.Length, into = "Length", sep = ";", fill = "right")
+```
+
+```{r Normalise TMP}
+df <- ARG_all.x
+rownames(df) <- df$ARO.Term
+df <- df[,-c(1)]
+
+df[is.na(df)] <- 0 # make NAs to zero, since that is what is in this case.
+
+ARGs <- ARGs[match(rownames(df), ARGs$ARG.ARO.Term),]
+size <- data.frame(ARG = ARGs$ARG.ARO.Term, Length = ARGs$Length)
+colnames(size) <- c("hgnc_symbol", "transcript_length")
+
+df.tmp <- NormalizeTPM(df, tr_length = size, scale = 1e+06) # the scale is just a constant, which can be changed, i added a million, so the total sum for each sample i 1.
+colSums(df.tmp) # check Sample 
+ARGs.tmp <- df.tmp
+```
+
+```{r filter low variant ARGs, warning=FALSE}
+# filter low variant OTUs out
+#  First find the desired quantile breaks for the entire matrix
+qt <- quantile(df.tmp , probs = c(0.10,0.90) )
+#Taking out OTUs fall outside the qt breaks
+rows <- apply( df.tmp , 1 , function(x) any( x < qt[1] | x > qt[2] ) )
+#And subsetting on this vector
+df.tmp.filtered <- df.tmp[ rows , ]
+ARG.filtered <- ARGs[match(rownames(df.tmp.filtered), ARGs$ARG.ARO.Term),]
+ARG.filtered <- ARG.filtered %>% tidyr::separate(ARG.Drug.Class, into = "Class", sep = ";", fill = "right")
+```
+
+```{r ARG Heatmap based om TMP normalised data}
+col_fun = circlize::colorRamp2(c(0, 0.001, 0.25,0.5,0.75), c("#0c336b","#db3030","#f57914", "#affabf", "#08a377")) 
+
+# Make colour codes for HA
+ha_right_col <- list("Class" = setNames(col_vector[1:22], unique(ARG.filtered$Class)), 
+               "Plasmid" = c("YES" = "Black", "NO" = "White", "no data" = "grey80"),
+               "Bacteria" = c("YES" = "Black", "NO" = "White", "no data" = "grey80"))
+
+#
+ha_mix_right = HeatmapAnnotation(Class = ARG.filtered$Class, 
+                                 Plasmid = ARG.filtered$ARG.Resistomes...Variants..Observed.in.Plasmid.s., 
+                                 Bacteria = ARG.filtered$ARG.Resistomes...Variants..Observed.in.Genome.s.,
+                                 which = "row", width = unit(1.5, "cm"), col = ha_right_col)
+top_col = list("Life_Style" = c("Wild" = "#2c7843", "Captive" = "#e63c3c"))
+ha <- HeatmapAnnotation(
+  Life_Style = md$Wild_OR_Captive,
+  col = top_col
+)
+#pdf("ARG_Occurence.pdf", height = 10, width = 15)
+Heatmap(df.tmp.filtered,
+        top_annotation = ha,
+        col = col_fun) + ha_mix_right
+#dev.off()
+```
+
+Compare MAG and viral diversity with ARGs
+```{r }
+library(hilldiv)
+vOTUs <- read.csv("../../01_VIROME/raw_vOTU_table.txt", sep = "\t", row.names = 1)
+MAGs <- read_excel("../../03_BACTERIA/mean_coverage_Q2Q3.xlsx")
+bins <- MAGs$bins[1:112]
+MAGs <- MAGs[1:112,-c(1)]
+rownames(MAGs) <- bins
+#
+Divs <- data.frame("ARGs" = hill_div(df,qvalue=0),
+                   "vOTUs" =hill_div(vOTUs,qvalue=0),
+                   "MAGs" =hill_div(MAGs,qvalue=0))
+
+# create multiple linear model
+lm_MAGs <- lm(ARGs ~ MAGs, data=Divs)
+summary(lm_MAGs)
+anova(lm_MAGs)
+# plot
+#pdf("MAG_x_ARGs_richness.pdf", height = 4, width = 6)
+ggplot(data = Divs, aes(x = ARGs, y=MAGs)) + geom_point(size = 2) +  geom_smooth(method='lm', color = "red") +
+      labs(title = paste("Adj R2 = ",signif(summary(lm_MAGs)$adj.r.squared, 5),
+                         "Intercept =",signif(lm_MAGs$coef[[1]],5 ),
+                         " Slope =",signif(lm_MAGs$coef[[2]], 5),
+                         " P =",signif(summary(lm_MAGs)$coef[2,4], 5))) + theme_minimal()
+#dev.off()
+lm_vOTUs <- lm(ARGs ~ vOTUs, data=Divs)
+summary(lm_vOTUs)  
+anova(lm_vOTUs)
+ggplot(data = Divs, aes(x = ARGs, y=vOTUs)) + geom_point(size = 2) + geom_smooth(method='lm', color = "red") +
+  labs(title = paste("Adj R2 = ",signif(summary(lm_vOTUs)$adj.r.squared, 5),
+                         "Intercept =",signif(lm_vOTUs$coef[[1]],5 ),
+                         " Slope =",signif(lm_vOTUs$coef[[2]], 5),
+                         " P =",signif(summary(lm_vOTUs)$coef[2,4], 5))) + theme_minimal()
+
+
+```
+
+Compare MAGs and ARGs occurence
+```{r }
+vOTU.Summary <- read.csv("../../01_VIROME/final-viral-score.tsv", sep = "\t")
+vOTU.Summary <- vOTU.Summary[match(rownames(vOTUs), vOTU.Summary$seqname),]
+size <- data.frame(vOTU = vOTU.Summary$seqname, Length = vOTU.Summary$length)
+colnames(size) <- c("hgnc_symbol", "transcript_length")
+vOTU.tmp <- NormalizeTPM(vOTUs, tr_length = size, scale = 1e+06) # the scale is just a constant, which can be changed, i added a million, so the total sum for each sample i 1.
+
+MAG.Summary <- read_excel("../../03_BACTERIA/MAG_summary.xlsx")
+MAG.Summary <- MAG.Summary[1:112,]
+MAG.tax <- MAG.Summary[,c(1,8:14)]
+colnames(MAG.tax) <- c("bins", "Domain","Phylum","Class","Order","Family","Genus","Species")
+size <- data.frame(MAGs = MAG.Summary$`MAGs/Bins`, Length = MAG.Summary$total_length)
+colnames(size) <- c("hgnc_symbol", "transcript_length")
+MAGs.tmp <- NormalizeTPM(MAGs, tr_length = size, scale = 1e+06) # the scale is just a constant, which can be changed, i added a million, so the total sum for each sample i 1.
+
+# filter low variant MAGs out
+#  First find the desired quantile breaks for the entire matrix
+qt <- quantile(MAGs.tmp , probs = c(0.1,0.9) )
+#Taking out OTUs fall outside the qt breaks
+rows <- apply( MAGs.tmp , 1 , function(x) any( x < qt[1] | x > qt[2] ) )
+#And subsetting on this vector
+MAGs.tmp.filtered <- MAGs.tmp[ rows , ]
+
+# filter low variant vOTUs out
+#  First find the desired quantile breaks for the entire matrix
+qt <- quantile(vOTU.tmp , probs = c(0.1,0.9) )
+#Taking out vOTUs fall outside the qt breaks
+rows <- apply(vOTU.tmp , 1 , function(x) any( x < qt[1] | x > qt[2] ) )
+vOTUs.tmp.filtered <- vOTU.tmp[ rows , ]
+
+# filter low variant vOTUs out
+#  First find the desired quantile breaks for the entire matrix
+qt <- quantile(ARGs.tmp , probs = c(0.1,0.9) )
+#Taking out vOTUs fall outside the qt breaks
+rows <- apply(ARGs.tmp , 1 , function(x) any( x < qt[1] | x > qt[2] ) )
+ARGs.tmp.filtered <- ARGs.tmp[ rows , ]
+```
+
+```{r Correlate filtered data}
+# Correlate data
+mat_data <- psych::corr.test(t(ARGs.tmp.filtered), t(MAGs.tmp.filtered), use = "pairwise",method="pearson",adjust="bonferroni", alpha=0.05,ci=T)
+p <- mat_data$p.adj
+mat_data <- mat_data$r
+#Summarize correlations
+sum(table(mat_data[mat_data > 0.5]))
+sum(table(mat_data[mat_data < -0.5]))
+sum(table(p[p < 0.05]))
+mat_data <- mat_data[,-59] # "CM_MAG_00096" is pure NAs and therefore removed.
+```
+
+```{r Plot Correlations between MAGs and ARGs, fig.height=22, fig.width=10}
+set.seed(1) # This makes the plot appear the same each time it is run 
+n <- 100
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+## make a corrplot
+# filter out non-significant correlations
+p <- p[,-59] # removing CM_MAG_00096
+rows <- apply( p , 1 , function(x) any( x < 0.05) )
+table(rows)
+columns <- apply( p , 2 , function(x) any( x < 0.05) )
+table(columns)
+mat_data.filtered <- mat_data[rows,columns]
+
+#Clustering of PAMs
+set.seed(1)
+pa_r = cluster::pam(mat_data.filtered, k = 8)
+pa_c = cluster::pam(t(mat_data.filtered), k = 7)
+#
+MAG_info.filtered <- MAG.tax[match(colnames(mat_data.filtered),MAG.tax$bins),]
+MAG_tax_info <- sapply(MAG_info.filtered, function(x) n_distinct(x))
+
+col = list(MAG_Genus = setNames(col_vector[1:MAG_tax_info["Genus"]], unique(MAG_info.filtered$Genus)),
+           MAG_Phylum = setNames(col_vector[1:MAG_tax_info["Phylum"]], unique(MAG_info.filtered$Phylum)))
+col$MAG_Genus[["Unknown"]] <- "grey20"
+col$MAG_Family[["Unknown"]] <- "grey20"
+# Annotate side graphs in heatmap
+
+ha <- HeatmapAnnotation(
+  MAG_Genus = MAG_info.filtered$Genus, 
+  MAG_Phylum = MAG_info.filtered$Phylum, 
+  col = col
+)
+
+#pdf("ARG_MAG_corr.pdf", height=14, width=10)
+col_fun = circlize::colorRamp2(c(-1, 0, 1), c("#db3030", "#affabf", "#08a377"))
+Heatmap(mat_data.filtered, col = col_fun,
+        top_annotation = ha,
+        split = paste0("", pa_r$clustering),
+        column_split = paste0("", pa_c$clustering), 
+        row_dend_side = "right",
+        row_names_side = c("left"),
+        width = 1) #+ ha_mix_right
+#dev.off()
+```
+
+```{r Make venn diagram, fig.height=6, fig.width=8}
+Venn.data <- tibble(ARGs$ARG.Drug.Class,rowSums(ARGs.tmp[,1:7]),
+                        ARGs.tmp[,8])
+Venn.data[,2:3][Venn.data[,2:3] > 0] <- 1
+colnames(Venn.data) <- c("value","Wild","Captive")
+Venn.data$Wild <- ifelse(Venn.data$Wild == 1, TRUE, FALSE)
+Venn.data$Captive <- ifelse(Venn.data$Captive == 1, TRUE, FALSE)
+
+# creating venn diagram for four sets
+#pdf("ARG_Venn.pdf", height = 6, width = 8)
+ggvenn(Venn.data,fill_color=c("darkgreen","red"))
+#dev.off()
+
+Venn.data <- tibble(ARGs$ARG.Drug.Class,rowSums(ARGs.tmp[,1:7]),
+                        ARGs.tmp[,8])
+Venn.data[,2:3][Venn.data[,2:3] > 0] <- 1
+colnames(Venn.data) <- c("value","Wild","Captive")
+Venn.data$Both <- ifelse(Venn.data$Wild + Venn.data$Captive == 2, 1, 0)
+Venn.data <- Venn.data[Venn.data$Both > 0,]
+Venn.data$Clean_class <- gsub(";.*","",Venn.data$value) # remove all efter ;
+```
+
+```{r make ARG count table}
+
+ARG.table <- as.data.frame(table(Venn.data$Clean_class))
+
+#pdf("No_shared_ARGs.pdf", height = 6, width = 10)
+ggplot(ARG.table, aes(x = reorder(Var1, -Freq), y = Freq)) + geom_bar(stat = "identity") + theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + ylab("No. shared ARGs") + xlab("ARG Class")
+#dev.off()
+```
